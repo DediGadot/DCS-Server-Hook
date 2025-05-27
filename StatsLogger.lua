@@ -1,6 +1,6 @@
 --[[
     StatsLogger.lua
-    Version: 1.2.0 (XML Statistics Summary Output)
+    Version: 1.4.0 (Code Cleanup and Log Level Refinement)
 
     Purpose:
     To log Air-to-Air (A2A) and Air-to-Ground (A2G) combat statistics for each pilot
@@ -20,24 +20,21 @@
 
     Dependencies:
     Relies heavily on MIST (Mission Scripting Tools), ideally version 4.3.74 or later.
-    This is due to the use of functions like `mist.utils.log`, `mist.scheduleFunction`,
-    `mist.addEventHandler`, and assumptions about the structure of `mist.DBs` (e.g.,
-    `mist.DBs.Players`, `mist.DBs.unitsById`, `mist.DBs.playersByUnitName`).
-    MIST (e.g., mist.lua or a versioned file like mist-4_5_110.lua) should be placed in:
-    - %USERPROFILE%\Saved Games\DCS\Scripts\mist.lua
-    - %USERPROFILE%\Saved Games\DCS\Scripts\MIST\mist.lua (if organized in a MIST subfolder)
+    MIST (e.g., mist.lua or a versioned file like mist-4_5_110.lua) should be placed in
+    one of the paths specified in `StatsLoggerConfig.mistSearchPaths`.
 
     Output:
     - Debug Log: Creates a detailed operational log. If MIST is unavailable, this log
-      is at `Logs\StatsLogger_Debug.xml` within the `lfs.writedir()` path 
-      (typically %USERPROFILE%\Saved Games\DCS\). This log tracks script initialization, 
-      event processing, errors, etc., with each entry as an XML fragment.
+      is at the path specified by `StatsLoggerConfig.logDirectory .. StatsLoggerConfig.debugLogName`.
+      This log tracks script initialization, event processing, errors, etc., with each entry as an XML fragment,
+      respecting the configured log level.
       If MIST is available, logging uses `mist.utils.log` which has its own format and destination.
     - Statistics Summary: Generates an XML summary of all collected statistics
-      at `Logs\CombatStats_Summary.xml` (also in `lfs.writedir()\Logs\`). This file is
-      overwritten periodically and upon mission end.
+      at the path specified by `StatsLoggerConfig.logDirectory .. StatsLoggerConfig.statsSummaryName`.
+      This file is overwritten periodically and upon mission end.
 
     Key Features:
+    - Configurable: Most operational parameters can be set in the `StatsLoggerConfig` table.
     - Tracks individual pilot statistics (keyed by UCID if available, otherwise by pilot name).
     - Tracks aggregate statistics for formations/groups.
     - Records weapon-specific statistics for pilots (shots, hits, kills per weapon type).
@@ -45,21 +42,65 @@
     - Includes basic friendly fire detection (based on coalition allegiance).
     - Handles various combat events: SHOT, HIT, KILL, UNIT_LOST, PLAYER_DEAD.
     - Data persistence: Saves statistics periodically and at the end of the mission to an XML file.
-    - Centralized logging. Fallback log (if MIST is not used) is in XML fragment format.
+    - Centralized logging with configurable level for fallback XML log.
 --]]
 
--- Attempt to load MIST.
--- lfs.writedir() typically points to %USERPROFILE%\Saved Games\DCS (or DCS.openbeta)
-local mist_search_paths = {
-    lfs.writedir() .. [[Scripts\mist.lua]],
-    lfs.writedir() .. [[Scripts\MIST\mist.lua]], 
-    lfs.writedir() .. [[Scripts\mist-4.5.110.lua]], 
-    lfs.writedir() .. [[Scripts\mist-4.3.74.lua]] 
-}
-local mist_loaded_successfully = false
-local mist_load_err = "MIST not found in any specified path."
+--[[
+    Configuration Block for StatsLogger
+    All user-configurable parameters should be set here.
+--]]
+StatsLoggerConfig = {
+    -- MIST Paths: List of paths/filenames to search for MIST.
+    -- The script will try these in order. lfs.writedir() points to Saved Games\DCS\ (or .openbeta)
+    mistSearchPaths = {
+        lfs.writedir() .. [[Scripts\mist.lua]],
+        lfs.writedir() .. [[Scripts\MIST\mist.lua]], 
+        lfs.writedir() .. [[Scripts\mist-4.5.110.lua]], 
+        lfs.writedir() .. [[Scripts\mist-4.3.74.lua]]  
+    },
 
-for _, path in ipairs(mist_search_paths) do
+    -- Log File Configuration
+    logDirectory = lfs.writedir() .. [[Logs\]], 
+    debugLogName = "StatsLogger_Debug.xml",     
+    statsSummaryName = "CombatStats_Summary.xml", 
+    
+    -- Logging Level for the custom Log function (fallback when MIST is not used)
+    -- Valid levels: "DEBUG", "INFO", "WARNING", "ERROR"
+    -- Messages with a lower severity than this level will not be logged by the custom XML fallback logger.
+    logLevel = "INFO", 
+
+    -- Periodic Save Interval for Statistics Summary
+    statsSaveInitialDelay = 300, 
+    statsSaveRepeatInterval = 300, 
+
+    -- Default/Fallback Strings
+    defaultUnknownUnitName = "UnknownUnit_CFG",
+    defaultUnknownTypeName = "UnknownType_CFG",
+    defaultUnknownGroupName = "UnknownGroup_CFG",
+    defaultUnknownCoalition = "UnknownCoalition_CFG",
+    defaultPilotUcid = "N/A_UCID_CFG", 
+    defaultFormationNameForUngrouped = "Ungrouped_Units_CFG",
+    defaultWeaponName = "UnknownWeapon_CFG",
+    defaultWeaponTypeName = "UnknownWeaponType_CFG",
+    defaultKeyForUnknownPilot = "ErrorStatsKey_CFG", 
+    
+    internalPlaceholderPrefix_UnitNameID = "UnitNameID_CFG_", 
+    internalPlaceholderPrefix_PlayerUnitME_ID = "PlayerUnitME_ID_CFG_",
+    internalPlaceholderPrefix_AI_UnitID = "AI_UnitID_CFG_",
+    internalPlaceholderPrefix_NoController_UnitID = "NoController_UnitID_CFG_",
+    internalPlaceholderPrefix_UnnamedGroup_ID = "UnnamedGroup_ID_CFG_",
+    internalPlaceholderPrefix_Ungrouped_UnitID = "Ungrouped_UnitID_CFG_", 
+    internalPlaceholderPrefix_InvalidPilotName = "InvalidPilotName_CFG_",
+    internalPlaceholderPrefix_ErrorDisplay = "ErrorDisplay_CFG_"
+}
+-- End of Configuration Block
+
+
+-- Attempt to load MIST.
+local mist_loaded_successfully = false
+local mist_load_err = "MIST not found in any specified path (checked StatsLoggerConfig.mistSearchPaths)."
+
+for _, path in ipairs(StatsLoggerConfig.mistSearchPaths) do
     local success, err = pcall(function() dofile(path) end)
     if success then
         mist_loaded_successfully = true
@@ -73,7 +114,7 @@ end
 -- Helper function to escape special XML characters
 local function escapeXmlChars(str)
     if type(str) ~= "string" then
-        str = tostring(str or "") -- Ensure it's a string, handle nil
+        str = tostring(str or "") 
     end
     str = string.gsub(str, "&", "&amp;")
     str = string.gsub(str, "<", "&lt;")
@@ -84,30 +125,36 @@ local function escapeXmlChars(str)
 end
 
 -- Centralized Log function
-local debugLogPath = lfs.writedir() .. [[Logs\StatsLogger_Debug.xml]] 
+local debugLogPath = StatsLoggerConfig.logDirectory .. StatsLoggerConfig.debugLogName
+local logLevelsNum = { DEBUG = 1, INFO = 2, WARNING = 3, ERROR = 4 } -- Numeric representation for log levels
+local configuredNumericLevel = logLevelsNum[string.upper(StatsLoggerConfig.logLevel or "INFO")] or 2 -- Default to INFO if invalid
 
 local function Log(message, level)
-    local logLevel = level or "INFO" 
+    local messageLogLevelStr = level or "INFO" 
     
     if mist and mist.utils and mist.utils.log then
-        mist.utils.log("StatsLogger: " .. message, logLevel) 
+        mist.utils.log("StatsLogger: " .. message, messageLogLevelStr) 
     else
-        local escapedMessage = escapeXmlChars(message) 
-        local escapedLevel = escapeXmlChars(logLevel)   
-        local isoTimestamp = os.date("!%Y-%m-%dT%H:%M:%SZ") 
-        
-        local xmlEntry = string.format("<logEntry timestamp=\"%s\" level=\"%s\" message=\"%s\" />\n", 
-                                       isoTimestamp, 
-                                       escapedLevel, 
-                                       escapedMessage)
-        
-        local file, err_io = io.open(debugLogPath, "a")
-        if file then
-            file:write(xmlEntry)
-            file:close()
-        else
-            print(os.date("[%Y-%m-%d %H:%M:%S]") .. " StatsLogger XML Fallback Log Error: Failed to open log file '" .. debugLogPath .. "': " .. tostring(err_io) .. 
-                  " | Original Message (" .. logLevel .. "): " .. message)
+        local messageNumericLevel = logLevelsNum[string.upper(messageLogLevelStr)] or 2 -- Default to INFO if invalid level passed
+
+        if messageNumericLevel >= configuredNumericLevel then
+            local escapedMessage = escapeXmlChars(message) 
+            local escapedLevel = escapeXmlChars(messageLogLevelStr) -- Use original messageLogLevelStr string for the attribute value
+            local isoTimestamp = os.date("!%Y-%m-%dT%H:%M:%SZ") 
+            
+            local xmlEntry = string.format("<logEntry timestamp=\"%s\" level=\"%s\" message=\"%s\" />\n", 
+                                           isoTimestamp, 
+                                           escapedLevel, 
+                                           escapedMessage)
+            
+            local file, err_io = io.open(debugLogPath, "a")
+            if file then
+                file:write(xmlEntry)
+                file:close()
+            else
+                print(os.date("[%Y-%m-%d %H:%M:%S]") .. " StatsLogger XML Fallback Log Error: Failed to open log file '" .. debugLogPath .. "': " .. tostring(err_io) .. 
+                      " | Original Message (" .. messageLogLevelStr .. "): " .. message)
+            end
         end
     end
 end
@@ -116,8 +163,7 @@ if mist_loaded_successfully and mist and mist.utils and mist.utils.log then
     Log("MIST loaded successfully. Version (if available via mist.version): " .. (mist.version or "Unknown/Older"), "INFO")
 else
     local error_message = "CRITICAL ERROR: StatsLogger.lua could not load MIST or the MIST version is too old (missing mist.utils.log or other key functions). " ..
-                          "Ensure a compatible MIST version (e.g., v4.3.74 or later) is correctly placed in " ..
-                          "Saved Games\\DCS\\Scripts\\ (e.g., mist.lua) or Saved Games\\DCS\\Scripts\\MIST\\mist.lua. " ..
+                          "Ensure a compatible MIST version (e.g., v4.3.74 or later) is correctly placed in one of the paths specified in StatsLoggerConfig.mistSearchPaths. " ..
                           "Last MIST load attempt error: " .. tostring(mist_load_err)
     Log(error_message, "ERROR") 
     print(os.date("[%Y-%m-%d %H:%M:%S]") .. " " .. error_message) 
@@ -141,13 +187,13 @@ function getUnitDetails(unitObject)
 
     local unitId = unitObject:getID()
     local details = {
-        name = "UnknownName_ID_" .. tostring(unitId), 
-        typeName = "UnknownType",
-        groupName = "UnknownGroup",
+        name = StatsLoggerConfig.internalPlaceholderPrefix_UnitNameID .. tostring(unitId), 
+        typeName = StatsLoggerConfig.defaultUnknownTypeName,
+        groupName = StatsLoggerConfig.defaultUnknownGroupName,
         category = "UnknownCategory", 
         isPlayer = false,
-        coalition = "UnknownCoalition",
-        ucid = "N/A_UCID", 
+        coalition = StatsLoggerConfig.defaultUnknownCoalition,
+        ucid = StatsLoggerConfig.defaultPilotUcid, 
         id = unitId 
     }
 
@@ -157,14 +203,14 @@ function getUnitDetails(unitObject)
     if coalitionId == 0 then details.coalition = "Neutral"
     elseif coalitionId == 1 then details.coalition = "Red"
     elseif coalitionId == 2 then details.coalition = "Blue"
-    else details.coalition = "OtherCoalition-" .. tostring(coalitionId) 
+    else details.coalition = StatsLoggerConfig.defaultUnknownCoalition .. "-" .. tostring(coalitionId) 
     end
 
     local controller = unitObject:getController()
     if controller then
         if controller:isPlayer() then
             details.isPlayer = true
-            local unitNameInME = unitObject:getName() or ("PlayerUnitME_ID_" .. tostring(unitId)) 
+            local unitNameInME = unitObject:getName() or (StatsLoggerConfig.internalPlaceholderPrefix_PlayerUnitME_ID .. tostring(unitId)) 
             local playerNameByUnit = unitObject:getPlayerName() 
 
             if playerNameByUnit and playerNameByUnit ~= "" then
@@ -230,22 +276,22 @@ function getUnitDetails(unitObject)
                 Log("getUnitDetails: MIST or mist.DBs not available for UCID retrieval for player: " .. details.name .. " (Unit ID: " .. unitId .. ").", "DEBUG")
             end
             
-            if details.ucid == "N/A_UCID" then
-                 Log("getUnitDetails: UCID remains N/A for player: " .. details.name .. " (Unit ID: " .. unitId .. "). Will use name as key if this pilot is involved in stats.", "WARNING")
+            if details.ucid == StatsLoggerConfig.defaultPilotUcid then 
+                 Log("getUnitDetails: UCID remains default ('" .. StatsLoggerConfig.defaultPilotUcid .. "') for player: " .. details.name .. " (Unit ID: " .. unitId .. "). Will use name as key if this pilot is involved in stats.", "WARNING")
             end
             Log("getUnitDetails: Player unit processed: Name='" .. details.name .. "', UCID='" .. details.ucid .. "', Type='" .. details.typeName .. "', Coalition='" .. details.coalition .. "'.", "INFO")
         else
-            details.name = unitObject:getName() or ("AI_UnitID_" .. tostring(unitId)) 
+            details.name = unitObject:getName() or (StatsLoggerConfig.internalPlaceholderPrefix_AI_UnitID .. tostring(unitId)) 
             Log("getUnitDetails: AI unit processed: Name='" .. details.name .. "', Type='" .. details.typeName .. "', Coalition='" .. details.coalition .. "'.", "INFO")
         end
     else
-        details.name = unitObject:getName() or ("NoController_UnitID_" .. tostring(unitId)) 
+        details.name = unitObject:getName() or (StatsLoggerConfig.internalPlaceholderPrefix_NoController_UnitID .. tostring(unitId)) 
         Log("getUnitDetails: Unit with no controller (e.g., static object): Name='" .. details.name .. "', Type='" .. details.typeName .. "', Coalition='" .. details.coalition .. "'.", "DEBUG")
     end
 
     local group = unitObject:getGroup()
     if group and group:isExist() then
-        details.groupName = group:getName() or "UnnamedGroup_ID_"..tostring(group:getID())
+        details.groupName = group:getName() or (StatsLoggerConfig.internalPlaceholderPrefix_UnnamedGroup_ID .. tostring(group:getID()))
         local groupCatId = group:getCategory()
         if groupCatId == Group.Category.AIRPLANE or groupCatId == Group.Category.HELICOPTER then
             details.category = "Air"
@@ -259,7 +305,7 @@ function getUnitDetails(unitObject)
         end
     else
         Log("getUnitDetails: Unit '" .. details.name .. "' (ID: " .. details.id .. ") has no group or group does not exist. GroupName set to default for ungrouped units.", "DEBUG")
-        details.groupName = "Ungrouped_UnitID_" .. tostring(details.id) 
+        details.groupName = StatsLoggerConfig.internalPlaceholderPrefix_Ungrouped_UnitID .. tostring(details.id) 
     end
     
     Log("getUnitDetails: Final details for unit ID " .. details.id .. ": Name=" .. details.name .. ", UCID=" .. details.ucid .. ", Group=" .. details.groupName .. ", Category=" .. details.category .. ", Coalition=" .. details.coalition, "DEBUG")
@@ -269,14 +315,18 @@ end
 function getWeaponDetails(weaponObject)
     if not weaponObject or not weaponObject:isExist() then
         Log("getWeaponDetails: called with invalid or non-existent weaponObject.", "WARNING")
-        return { name = "UnknownWeapon_InvalidObj", typeName = "UnknownWeaponType_InvalidObj" } 
+        return { name = StatsLoggerConfig.defaultWeaponName .. "_InvalidObj", typeName = StatsLoggerConfig.defaultWeaponTypeName .. "_InvalidObj" } 
     end
+    
+    local wName = weaponObject:getName()
+    local wTypeName = weaponObject:getTypeName()
+
     local details = {
-        name = weaponObject:getName() or "DefaultWeaponName", 
-        typeName = weaponObject:getTypeName() or "DefaultWeaponTypeName"
+        name = (wName and wName ~= "") and wName or StatsLoggerConfig.defaultWeaponName,
+        typeName = (wTypeName and wTypeName ~= "") and wTypeName or StatsLoggerConfig.defaultWeaponTypeName
     }
-    if details.name == "" then details.name = "EmptyWeaponName_Resolved" end
-    if details.typeName == "" then details.typeName = "EmptyWeaponTypeName_Resolved" end
+    -- Note: The original logic for empty strings (e.g., `details.name == "" then details.name = ...`) is now covered by the above conditional assignments.
+    -- If `getName()` returns `""`, `(wName and wName ~= "")` will be false, thus assigning the default.
 
     Log("getWeaponDetails: Weapon: Name='" .. details.name .. "', TypeName='" .. details.typeName .. "'.", "DEBUG")
     return details
@@ -289,31 +339,31 @@ Log("Data Access Helper Functions (getUnitDetails, getWeaponDetails) defined/ref
 ]]
 function ensurePilotStats(ucid_param, pilotName_param)
     local keyToUse = nil
-    local currentPilotName = pilotName_param or "UnknownPilotName_Ensure" 
+    local currentPilotName = pilotName_param or StatsLoggerConfig.defaultUnknownUnitName 
     local currentPilotUCID = ucid_param
 
-    if currentPilotName == "" or currentPilotName:match("UnknownName_ID_") then 
-        currentPilotName = "InvalidNameInEnsure_" .. (currentPilotUCID or "NoUCID")
+    if currentPilotName == "" or currentPilotName:match(StatsLoggerConfig.internalPlaceholderPrefix_UnitNameID) then 
+        currentPilotName = StatsLoggerConfig.internalPlaceholderPrefix_InvalidPilotName .. (currentPilotUCID or "NoUCID")
     end
     if currentPilotUCID == "" then currentPilotUCID = nil end 
 
-    if currentPilotUCID and currentPilotUCID ~= "N/A_UCID" and currentPilotUCID ~= "Unknown" then
+    if currentPilotUCID and currentPilotUCID ~= StatsLoggerConfig.defaultPilotUcid and currentPilotUCID ~= "Unknown" then 
         keyToUse = currentPilotUCID
-    elseif currentPilotName and currentPilotName ~= "UnknownPilotName_Ensure" and not currentPilotName:match("InvalidNameInEnsure_") then
+    elseif currentPilotName and currentPilotName ~= StatsLoggerConfig.defaultUnknownUnitName and not currentPilotName:match(StatsLoggerConfig.internalPlaceholderPrefix_InvalidPilotName) then
         keyToUse = currentPilotName 
         Log("ensurePilotStats: Using pilotName '" .. currentPilotName .. "' as key due to invalid or missing UCID ('" .. tostring(currentPilotUCID) .. "').", "WARNING")
     else
         local tempKeySuffix = (currentPilotUCID or "NoUCIDProvided") .. "_" .. (currentPilotName or "NoNameProvided")
-        local tempKey = "ErrorStatsKey_" .. string.gsub(tempKeySuffix, "[^%w_]", "") .. "_" .. os.time() .. "_" .. math.random(1000)
+        local tempKey = StatsLoggerConfig.defaultKeyForUnknownPilot .. "_" .. string.gsub(tempKeySuffix, "[^%w_]", "") .. "_" .. os.time() .. "_" .. math.random(1000)
         Log("ensurePilotStats: Critical: Cannot determine valid key from UCID ('" .. tostring(currentPilotUCID) .. "') and pilotName ('" .. tostring(currentPilotName) .. "'). Using temporary key: " .. tempKey, "ERROR")
         keyToUse = tempKey
-        currentPilotName = "ErrDisplay_Name_" .. (pilotName_param or "Nil") 
-        currentPilotUCID = "ErrDisplay_UCID_" .. (ucid_param or "Nil")
+        currentPilotName = StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay .. "Name_" .. (pilotName_param or "Nil") 
+        currentPilotUCID = StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay .. "UCID_" .. (ucid_param or "Nil")
     end
 
     if not pilotStats[keyToUse] then
         pilotStats[keyToUse] = {
-            ucid = (currentPilotUCID and currentPilotUCID ~= "N/A_UCID" and not currentPilotUCID:match("ErrDisplay_")) and currentPilotUCID or "N/A_StoredAtInit",
+            ucid = (currentPilotUCID and currentPilotUCID ~= StatsLoggerConfig.defaultPilotUcid and not currentPilotUCID:match(StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay)) and currentPilotUCID or (StatsLoggerConfig.defaultPilotUcid .. "_StoredAtInit"),
             name = currentPilotName, 
             A2A_kills = 0, A2G_kills = 0,
             A2A_hits = 0, A2G_hits = 0,
@@ -326,13 +376,13 @@ function ensurePilotStats(ucid_param, pilotName_param)
         Log("Initialized stats for pilot key: '" .. keyToUse .. "' (Stored Name: '" .. pilotStats[keyToUse].name .. "', Stored UCID: '" .. pilotStats[keyToUse].ucid .. "')", "INFO")
     else
         local statsEntry = pilotStats[keyToUse]
-        if (statsEntry.ucid == "N/A_StoredAtInit" or statsEntry.ucid:match("ErrDisplay_")) and 
-           (currentPilotUCID and currentPilotUCID ~= "N/A_UCID" and not currentPilotUCID:match("ErrDisplay_")) then
+        if (statsEntry.ucid == (StatsLoggerConfig.defaultPilotUcid .. "_StoredAtInit") or statsEntry.ucid:match(StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay)) and 
+           (currentPilotUCID and currentPilotUCID ~= StatsLoggerConfig.defaultPilotUcid and not currentPilotUCID:match(StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay)) then
             Log("ensurePilotStats: Updating UCID for key '" .. keyToUse .. "' from '"..statsEntry.ucid.."' to '" .. currentPilotUCID .. "'.", "INFO")
             statsEntry.ucid = currentPilotUCID
         end
-        if (statsEntry.name:match("UnknownPilotName_Ensure") or statsEntry.name:match("InvalidNameInEnsure_") or statsEntry.name:match("ErrDisplay_")) and 
-           (currentPilotName and not currentPilotName:match("UnknownPilotName_Ensure") and not currentPilotName:match("InvalidNameInEnsure_") and not currentPilotName:match("ErrDisplay_")) then
+        if (statsEntry.name:match(StatsLoggerConfig.defaultUnknownUnitName) or statsEntry.name:match(StatsLoggerConfig.internalPlaceholderPrefix_InvalidPilotName) or statsEntry.name:match(StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay)) and 
+           (currentPilotName and not currentPilotName:match(StatsLoggerConfig.defaultUnknownUnitName) and not currentPilotName:match(StatsLoggerConfig.internalPlaceholderPrefix_InvalidPilotName) and not currentPilotName:match(StatsLoggerConfig.internalPlaceholderPrefix_ErrorDisplay)) then
             if statsEntry.name ~= currentPilotName then
                  Log("ensurePilotStats: Updating display name for key '" .. keyToUse .. "' from '" .. statsEntry.name .. "' to '" .. currentPilotName .. "'.", "INFO")
                 statsEntry.name = currentPilotName
@@ -344,10 +394,10 @@ end
 
 local function ensureFormationStats(formationName_param)
     local formationName = formationName_param
-    if not formationName or formationName == "" or formationName == "UnknownGroup" or 
-       formationName:match("Ungrouped_UnitID_") or formationName:match("UnnamedGroup_ID_") then
-        Log("ensureFormationStats: Invalid or placeholder formationName ('" .. tostring(formationName) .. "'). Assigning to default 'Ungrouped_Units' category.", "DEBUG")
-        formationName = "Ungrouped_Units" 
+    if not formationName or formationName == "" or formationName == StatsLoggerConfig.defaultUnknownGroupName or 
+       formationName:match(StatsLoggerConfig.internalPlaceholderPrefix_Ungrouped_UnitID) or formationName:match(StatsLoggerConfig.internalPlaceholderPrefix_UnnamedGroup_ID) then
+        Log("ensureFormationStats: Invalid or placeholder formationName ('" .. tostring(formationName) .. "'). Assigning to default '" .. StatsLoggerConfig.defaultFormationNameForUngrouped .. "'.", "DEBUG")
+        formationName = StatsLoggerConfig.defaultFormationNameForUngrouped
     end
 
     if not formationStats[formationName] then
@@ -370,11 +420,11 @@ local function updatePilotWeaponStats(pilotKey, weaponTypeName_param, statType)
         Log("updatePilotWeaponStats: Invalid pilotKey '" .. tostring(pilotKey) .. "'. Cannot update weapon stats.", "WARNING")
         return
     end
-    if not weaponTypeName or weaponTypeName == "" or weaponTypeName == "UnknownWeaponType" or 
-       weaponTypeName:match("UnknownWeaponType_InvalidObj") or weaponTypeName:match("DefaultWeaponTypeName") or 
-       weaponTypeName:match("EmptyWeaponTypeName_Resolved") or weaponTypeName:match("UnknownWeapon_NotAvailable") then
-        Log("updatePilotWeaponStats: Invalid or default weaponTypeName ('"..tostring(weaponTypeName).."') for pilotKey '" .. pilotKey .. "'. Using 'TrackedUnknownWeapon'.", "DEBUG")
-        weaponTypeName = "TrackedUnknownWeapon"
+    if not weaponTypeName or weaponTypeName == "" or weaponTypeName == StatsLoggerConfig.defaultUnknownWeaponTypeName or 
+       weaponTypeName:match(StatsLoggerConfig.defaultWeaponTypeName .. "_InvalidObj") or weaponTypeName:match(StatsLoggerConfig.defaultWeaponTypeName) or 
+       weaponTypeName:match(StatsLoggerConfig.defaultWeaponTypeName .. "_EmptyResolved") or weaponTypeName:match("UnknownWeaponType_NotAvailableInEvent") then
+        Log("updatePilotWeaponStats: Invalid or default weaponTypeName ('"..tostring(weaponTypeName).."') for pilotKey '" .. pilotKey .. "'. Using '" .. StatsLoggerConfig.defaultWeaponTypeName .. "_Tracked'.", "DEBUG")
+        weaponTypeName = StatsLoggerConfig.defaultWeaponTypeName .. "_Tracked"
     end
 
     if not pilotStats[pilotKey].weaponStats[weaponTypeName] then
@@ -384,7 +434,7 @@ local function updatePilotWeaponStats(pilotKey, weaponTypeName_param, statType)
     Log("Updated weapon stats for " .. pilotStats[pilotKey].name .. " (Key: "..pilotKey..") - Weapon: " .. weaponTypeName .. ", Stat: " .. statType .. " = " .. pilotStats[pilotKey].weaponStats[weaponTypeName][statType], "DEBUG")
 end
 
-Log("Statistic Recording Helper Functions (ensurePilotStats, ensureFormationStats, updatePilotWeaponStats) defined/refined.", "INFO")
+Log("Statistic Recording Helper Functions (ensurePilotStats, ensureFormationStats, updatePilotWeaponStats) defined/refined with config values.", "INFO")
 
 --[[
     Main Event Handler: StatsEventHandler
@@ -430,7 +480,7 @@ function StatsEventHandler(event)
              Log("StatsEventHandler: Event " .. event.id .. ": Weapon object ("..tostring(event.weapon)..") does not exist or is invalid.", "DEBUG")
         end
     end
-    weaponDetails = weaponDetails or { name = "UnknownWeapon_NotAvailableInEvent", typeName = "UnknownWeaponType_NotAvailableInEvent" }
+    weaponDetails = weaponDetails or { name = StatsLoggerConfig.defaultWeaponName .. "_NotAvailableInEvent", typeName = StatsLoggerConfig.defaultWeaponTypeName .. "_NotAvailableInEvent" }
 
     if initiatorDetails and targetDetails then
         if initiatorDetails.category == "Air" and targetDetails.category == "Air" then
@@ -443,7 +493,7 @@ function StatsEventHandler(event)
             interactionType = "Other" 
         end
         
-        if initiatorDetails.coalition ~= "UnknownCoalition" and targetDetails.coalition ~= "UnknownCoalition" and 
+        if initiatorDetails.coalition ~= StatsLoggerConfig.defaultUnknownCoalition and targetDetails.coalition ~= StatsLoggerConfig.defaultUnknownCoalition and 
            initiatorDetails.coalition == targetDetails.coalition and 
            initiatorDetails.coalition ~= "Neutral" and 
            initiatorDetails.id ~= targetDetails.id then 
@@ -540,7 +590,7 @@ function StatsEventHandler(event)
             else Log(eventType .. ": Failed to get valid pilot/formation key for KILLED target: " .. (targetDetails.name or "Name N/A"), "WARNING")
             end
 
-            Log(eventType .. ": " .. (initiatorDetails.name or "Unknown Initiator") .. " killed " .. targetDetails.name .. " (" .. interactionType .. ") FF: " .. tostring(isFriendlyFire) .. " Weapon: "..weaponDetails.typeName, "INFO")
+            Log(eventType .. ": " .. (initiatorDetails.name or StatsLoggerConfig.defaultUnknownUnitName) .. " killed " .. targetDetails.name .. " (" .. interactionType .. ") FF: " .. tostring(isFriendlyFire) .. " Weapon: "..weaponDetails.typeName, "INFO")
         
         elseif not initiatorDetails and targetDetails then 
             local targetPilotKey = ensurePilotStats(targetDetails.ucid, targetDetails.name)
@@ -549,7 +599,7 @@ function StatsEventHandler(event)
                 pilotStats[targetPilotKey].deaths = (pilotStats[targetPilotKey].deaths or 0) + 1
                 formationStats[targetFormationKey].deaths = (formationStats[targetFormationKey].deaths or 0) + 1
                 Log(eventType .. ": " .. targetDetails.name .. " died (no specific unit initiator - e.g. crash, terrain impact, world object)", "INFO")
-            else Log(eventType .. ": Failed to get valid pilot/formation key for KILLED (by environment) target: " .. (targetDetails.name or "Name N/A"), "WARNING")
+            else Log(eventType .. ": Failed to get valid pilot/formation key for KILLED (by environment) target: " .. (targetDetails.name or StatsLoggerConfig.defaultUnknownUnitName), "WARNING")
             end
         else 
              Log(eventType .. ": Received with insufficient initiator/target details for full processing. Initiator: " .. tostring(initiatorDetails) .. ", Target: " .. tostring(targetDetails), "WARNING")
@@ -573,7 +623,7 @@ function StatsEventHandler(event)
                 pilotStats[pilotKey].deaths = (pilotStats[pilotKey].deaths or 0) + 1 
                 formationStats[formationKey].deaths = (formationStats[formationKey].deaths or 0) + 1
                 Log(eventType .. ": " .. pilotStats[pilotKey].name .. " recorded as lost/dead. (This might be a crash, suicide, or an uncredited/environmental kill. Check S_EVENT_KILL for combat details.)", "INFO")
-            else Log(eventType .. ": Failed to get pilot/formation key for lost/dead unit: " .. (unitLostDetails.name or "Name N/A"), "WARNING")
+            else Log(eventType .. ": Failed to get pilot/formation key for lost/dead unit: " .. (unitLostDetails.name or StatsLoggerConfig.defaultUnknownUnitName), "WARNING")
             end
         else
             eventType = (event.id == world.event.S_EVENT_UNIT_LOST) and "UNIT_LOST" or "PLAYER_DEAD"
@@ -602,29 +652,26 @@ end
 
 --[[
     Data Persistence
-    This section implements saving the collected statistics to a file.
 ]]
 
 local periodicSaveScheduleId = nil 
 
--- Saves the current pilotStats and formationStats tables to an XML formatted file.
 function SaveStatsToFile()
-    Log("Attempting to save statistics to CombatStats_Summary.xml...", "INFO")
+    Log("Attempting to save statistics to " .. StatsLoggerConfig.statsSummaryName .. "...", "INFO")
     
     local isoTimestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-    local statsData = {} -- Use a table to build lines for better performance and readability
+    local statsData = {} 
     
     table.insert(statsData, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n")
     table.insert(statsData, string.format("<CombatStatistics timestamp=\"%s\">\n", isoTimestamp))
 
-    -- Pilot Statistics
     table.insert(statsData, "  <PilotStats>\n")
     if not next(pilotStats) then
         table.insert(statsData, "    <!-- No pilot statistics recorded -->\n")
     else
         for pilotKey, stats in pairs(pilotStats) do
-            local pilotNameEscaped = escapeXmlChars(stats.name or "Unknown Name")
-            local pilotUcidEscaped = escapeXmlChars(stats.ucid or "N/A")
+            local pilotNameEscaped = escapeXmlChars(stats.name or StatsLoggerConfig.defaultUnknownUnitName)
+            local pilotUcidEscaped = escapeXmlChars(stats.ucid or StatsLoggerConfig.defaultPilotUcid)
             local pilotKeyEscaped = escapeXmlChars(pilotKey)
 
             table.insert(statsData, string.format("    <Pilot id=\"%s\" name=\"%s\" ucid=\"%s\">\n", pilotKeyEscaped, pilotNameEscaped, pilotUcidEscaped))
@@ -650,14 +697,13 @@ function SaveStatsToFile()
                 end
                 table.insert(statsData, "      </WeaponStats>\n")
             else
-                table.insert(statsData, "      <WeaponStats />\n") -- Empty element if no weapon stats
+                table.insert(statsData, "      <WeaponStats />\n") 
             end
             table.insert(statsData, "    </Pilot>\n")
         end
     end
     table.insert(statsData, "  </PilotStats>\n")
 
-    -- Formation Statistics
     table.insert(statsData, "  <FormationStats>\n")
     if not next(formationStats) then
         table.insert(statsData, "    <!-- No formation statistics recorded -->\n")
@@ -671,7 +717,7 @@ function SaveStatsToFile()
             table.insert(statsData, string.format("      <A2GHits>%d</A2GHits>\n", stats.A2G_hits or 0))
             table.insert(statsData, string.format("      <A2AShots>%d</A2AShots>\n", stats.A2A_shots or 0))
             table.insert(statsData, string.format("      <A2GShots>%d</A2GShots>\n", stats.A2G_shots or 0))
-            table.insert(statsData, string.format("      <MemberDeaths>%d</MemberDeaths>\n", stats.deaths or 0)) -- Renamed for clarity
+            table.insert(statsData, string.format("      <MemberDeaths>%d</MemberDeaths>\n", stats.deaths or 0)) 
             table.insert(statsData, string.format("      <FriendlyKillsByMembers>%d</FriendlyKillsByMembers>\n", stats.friendly_fire_kills or 0))
             table.insert(statsData, string.format("      <FriendlyHitsByMembers>%d</FriendlyHitsByMembers>\n", stats.friendly_fire_hits or 0))
             table.insert(statsData, "    </Formation>\n")
@@ -682,7 +728,7 @@ function SaveStatsToFile()
     table.insert(statsData, "</CombatStatistics>\n")
 
     local finalXmlData = table.concat(statsData)
-    local filePath = lfs.writedir() .. [[Logs\CombatStats_Summary.xml]] -- Changed file extension
+    local filePath = StatsLoggerConfig.logDirectory .. StatsLoggerConfig.statsSummaryName
     
     local file, err = io.open(filePath, "w") 
     if file then
@@ -694,13 +740,13 @@ function SaveStatsToFile()
     end
 end
 
-Log("Data persistence logic (SaveStatsToFile) updated for XML output.", "INFO")
+Log("Data persistence logic (SaveStatsToFile) using config values.", "INFO")
 
 
 if mist and mist.scheduleFunction then
     local argsToPass = {} 
-    local initialDelay = 300 
-    local repeatInterval = 300 
+    local initialDelay = StatsLoggerConfig.statsSaveInitialDelay 
+    local repeatInterval = StatsLoggerConfig.statsSaveRepeatInterval
 
     local success_schedule, returned_scheduleId_or_err = pcall(mist.scheduleFunction, nil, {SaveStatsToFile}, argsToPass, initialDelay, repeatInterval)
     if success_schedule and returned_scheduleId_or_err then
